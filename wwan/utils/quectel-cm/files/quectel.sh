@@ -13,6 +13,15 @@ QUECTEL_QMI_PROXY="/usr/bin/quectel-qmi-proxy"
 QUECTEL_QMI_PROXY_DEV="/dev/cdc-wdm0"
 QUECTEL_RUN_DIR="/var/run/quectel"
 
+# The lock everything else on the router takes before talking AT to the modem
+# (luci-app-aw1000-modem, multiwan-notify). It is the modem's lock rather than a
+# port's: every AT port leads to the same parser, so a command sent here while
+# a status poll or an SMS is mid-conversation on another port stalls one or both
+# of them. The wait is bounded because setup must not hang on a busy port; past
+# it the command is sent anyway, as it always was before this lock existed.
+QUECTEL_AT_LOCK="/var/lock/aw1000-modem.lock"
+QUECTEL_AT_LOCK_WAIT=20
+
 # Send a single AT command, discarding the response. sms_tool enforces its own
 # read timeout, so a silent or wrong port costs a couple of seconds instead of
 # blocking the setup script forever.
@@ -20,6 +29,32 @@ quectel_at() {
 	local atdevice="$1" cmd="$2"
 
 	[ -c "$atdevice" ] || return 1
+
+	# Without flock there is nothing to queue on; carry on unlocked.
+	if ! command -v flock >/dev/null || ! mkdir -p "${QUECTEL_AT_LOCK%/*}" 2>/dev/null; then
+		quectel_at_send "$atdevice" "$cmd"
+		return
+	fi
+
+	# In a subshell so fd 9, and with it the lock, is let go the moment the
+	# command is done - not held for the rest of setup. busybox flock has no -w,
+	# hence the retry loop.
+	(
+		waited=0
+		while ! flock -n -x 9; do
+			if [ "$waited" -ge "$QUECTEL_AT_LOCK_WAIT" ]; then
+				echo "The AT port stayed busy for ${QUECTEL_AT_LOCK_WAIT}s, sending $cmd anyway"
+				break
+			fi
+			sleep 1
+			waited=$((waited + 1))
+		done
+		quectel_at_send "$atdevice" "$cmd"
+	) 9>>"$QUECTEL_AT_LOCK"
+}
+
+quectel_at_send() {
+	local atdevice="$1" cmd="$2"
 
 	if command -v sms_tool >/dev/null; then
 		sms_tool -d "$atdevice" at "$cmd" >/dev/null 2>&1
@@ -876,11 +911,19 @@ proto_quectel_setup() {
 		json_select ..
 
 		if [ "$idx" -gt 0 ]; then
-			quectel_at "$atdevice" "AT+QNWLOCK=\"COMMON/4G\",${idx}${cell_ids}" ||
+			if quectel_at "$atdevice" "AT+QNWLOCK=\"COMMON/4G\",${idx}${cell_ids}"; then
+				: >"$QUECTEL_RUN_DIR/$interface.cell_lock"
+			else
 				echo "Failed to apply the 4G cell lock"
+			fi
 		fi
-	else
-		quectel_at "$atdevice" 'AT+QNWLOCK="COMMON/4G",0'
+	elif [ -e "$QUECTEL_RUN_DIR/$interface.cell_lock" ]; then
+		# Only take back a lock this proto put on. The modem holds one cell lock
+		# for everybody, and clearing it on every setup wiped a lock chosen
+		# elsewhere - from the AW1000's Modem > Lock page, or by hand over AT -
+		# each time the link reconnected.
+		quectel_at "$atdevice" 'AT+QNWLOCK="COMMON/4G",0' &&
+			rm -f "$QUECTEL_RUN_DIR/$interface.cell_lock"
 	fi
 
 	case "$pdptype" in
